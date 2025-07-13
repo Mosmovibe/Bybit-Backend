@@ -2,69 +2,119 @@ const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const multer = require('multer');
-const path = require('path');
 const cors = require('cors');
+const multer = require('multer');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
+
+// ✅ Secure headers and rate limiter
+app.use(helmet());
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100
+}));
+
+// ✅ CORS for both www and non-www domains
+const allowedOrigins = [
+  'https://bybittopglobal.com',
+  'https://www.bybittopglobal.com'
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
-app.use(cors());
 
-// Serve uploaded images
-app.use('/uploads', express.static('uploads'));
+// ✅ Ensure uploads folder exists
+const uploadDir = 'uploads';
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
+}
+app.use('/uploads', express.static(uploadDir));
 
-// Connect to MongoDB
+// ✅ Connect MongoDB
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ Connected to MongoDB'))
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => {
+    console.error('❌ MongoDB connection error:', err);
+    process.exit(1);
+  });
 
-// User Schema
+// ✅ Multer config for file uploads
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`);
+  },
+});
+const upload = multer({ storage });
+
+// ✅ Mongoose User schema
 const userSchema = new mongoose.Schema({
-  email: { type: String, unique: true },
+  fullname: { type: String, required: true },
+  email: { type: String, unique: true, required: true },
   password: String,
   profilePic: String,
-  balance: { type: Number, default: 0 },
-  isAdmin: { type: Boolean, default: false }, // ✅
+  balance: { type: Number, default: 0 }
 });
-
 const User = mongoose.model('User', userSchema);
 
-// JWT Auth Middleware
+// ✅ JWT middleware
 const auth = (req, res, next) => {
-  const token = req.headers['authorization'];
-  if (!token) return res.status(401).json({ error: 'No token provided' });
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
 
+  const token = authHeader.split(' ')[1];
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) return res.status(401).json({ error: 'Invalid token' });
+    req.user = decoded;
     req.userId = decoded.id;
     next();
   });
 };
 
-// Multer Config
-const storage = multer.diskStorage({
-  destination: 'uploads/',
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname);
-  },
-});
-const upload = multer({ storage });
+// ✅ Routes
 
-// ✅ Signup
+// Register (Fixed: returns token)
 app.post('/api/signup', async (req, res) => {
-  const { email, password } = req.body;
-  const hashed = await bcrypt.hash(password, 10);
+  const { fullname, email, password } = req.body;
+  if (!fullname || !email || !password) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
+
   try {
-    const user = new User({ email, password: hashed });
+    const existing = await User.findOne({ email });
+    if (existing) return res.status(400).json({ error: 'Email already exists' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({ fullname, email, password: hashedPassword });
     await user.save();
-    res.json({ message: '✅ User created!' });
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+    // ✅ Return token to keep user logged in
+    res.json({ token });
   } catch (err) {
-    res.status(400).json({ error: 'Email already exists!' });
+    console.error(err);
+    res.status(500).json({ error: 'Registration failed' });
   }
 });
 
-// ✅ Login
+// Login
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   const user = await User.findOne({ email });
@@ -73,63 +123,46 @@ app.post('/api/login', async (req, res) => {
   const isMatch = await bcrypt.compare(password, user.password);
   if (!isMatch) return res.status(400).json({ error: 'Wrong password' });
 
-  const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-  res.json({ token });
+  const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+  res.json({ token }); // ✅ Frontend should store this in localStorage
 });
 
-// ✅ Dashboard — returns ID + isAdmin
+// Protected: Dashboard
 app.get('/api/dashboard', auth, async (req, res) => {
   const user = await User.findById(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
   res.json({
-    id: user._id,
+    fullname: user.fullname,
     email: user.email,
-    profilePic: user.profilePic,
     balance: user.balance,
-    isAdmin: user.isAdmin, // ✅
+    profilePic: user.profilePic || null
   });
 });
 
-// ✅ Profile Picture Upload
-app.post('/api/upload', auth, upload.single('profilePic'), async (req, res) => {
-  try {
-    const user = await User.findById(req.userId);
-    user.profilePic = req.file.path;
-    await user.save();
-    res.json({ profilePic: user.profilePic });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Upload failed' });
-  }
+// Upload profile picture
+app.post('/api/upload-profile', auth, upload.single('profilePic'), async (req, res) => {
+  const user = await User.findById(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  user.profilePic = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  await user.save();
+
+  res.json({ profilePicUrl: user.profilePic });
 });
 
-// ✅ Admin-only Balance Update — update ANY user by email
-app.post('/api/balance', auth, async (req, res) => {
-  const { email, balance } = req.body;
-
-  const currentUser = await User.findById(req.userId);
-  if (!currentUser.isAdmin) {
-    return res.status(403).json({ error: 'Forbidden: Only admin can update balances' });
-  }
-
-  const user = await User.findOneAndUpdate(
-    { email },
-    { balance },
-    { new: true }
-  );
-
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  res.json({ message: `Balance for ${user.email} updated to $${user.balance}` });
-});
-
-// ✅ Root Route
+// Root test
 app.get('/', (req, res) => {
-  res.send('Your backend is running with MongoDB!');
+  res.send('✅ Bybit backend is working!');
 });
 
-// ✅ Start Server
-app.listen(3000, () => {
-  console.log('🚀 Server running at http://localhost:3000');
+// Fallback error handler
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something broke!' });
 });
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Backend running at http://localhost:3000`));
